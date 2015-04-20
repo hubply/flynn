@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-sql/driver"
+	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/pq"
 	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/julienschmidt/httprouter"
 	"github.com/flynn/flynn/Godeps/_workspace/src/golang.org/x/net/context"
 	"github.com/flynn/flynn/pkg/cors"
@@ -24,6 +26,7 @@ const (
 	SyntaxErrorCode             ErrorCode = "syntax_error"
 	ValidationErrorCode         ErrorCode = "validation_error"
 	PreconditionFailedErrorCode ErrorCode = "precondition_failed"
+	PostgresErrorCode           ErrorCode = "postgres_error"
 	UnknownErrorCode            ErrorCode = "unknown_error"
 )
 
@@ -34,6 +37,7 @@ var errorResponseCodes = map[ErrorCode]int{
 	PreconditionFailedErrorCode: 412,
 	SyntaxErrorCode:             400,
 	ValidationErrorCode:         400,
+	PostgresErrorCode:           500,
 	UnknownErrorCode:            500,
 }
 
@@ -62,6 +66,10 @@ func IsPreconditionFailedError(err error) bool {
 
 func IsValidationError(err error) bool {
 	return isJSONErrorWithCode(err, ValidationErrorCode)
+}
+
+func IsPostgresError(err error) bool {
+	return isJSONErrorWithCode(err, PostgresErrorCode)
 }
 
 var CORSAllowAllHandler = cors.Allow(&cors.Options{
@@ -136,11 +144,22 @@ func buildJSONError(err error) *JSONError {
 			Code:    SyntaxErrorCode,
 			Message: "The provided JSON input is invalid",
 		}
+	case *pq.Error:
+		jsonError = &JSONError{
+			Code:    PostgresErrorCode,
+			Message: v.Message,
+		}
 	case JSONError:
 		jsonError = &v
 	case *JSONError:
 		jsonError = v
 	default:
+		if err == driver.ErrBadConn {
+			return &JSONError{
+				Code:    PostgresErrorCode,
+				Message: "bad connection",
+			}
+		}
 		jsonError = &JSONError{
 			Code:    UnknownErrorCode,
 			Message: "Something went wrong",
