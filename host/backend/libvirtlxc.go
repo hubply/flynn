@@ -857,6 +857,10 @@ func (l *libvirtLXC) Stop(id string) error {
 	return c.Stop()
 }
 
+func (l *libvirtLXC) GetContainer(id string) (Container, error) {
+	return l.getContainer(id)
+}
+
 func (l *libvirtLXC) getContainer(id string) (*libvirtContainer, error) {
 	l.containersMtx.RLock()
 	defer l.containersMtx.RUnlock()

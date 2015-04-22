@@ -5,19 +5,141 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
+	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
+	zfs "github.com/flynn/flynn/Godeps/_workspace/src/github.com/mistifyio/go-zfs"
+	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/mitchellh/go-ps"
 	"github.com/flynn/flynn/Godeps/_workspace/src/github.com/syndtr/gocapability/capability"
 
-	"github.com/mitchellh/go-ps"
+	"github.com/flynn/flynn/host/logmux"
+	"github.com/flynn/flynn/host/types"
+	"github.com/flynn/flynn/host/volume"
+	"github.com/flynn/flynn/host/volume/manager"
+	zfsVolume "github.com/flynn/flynn/host/volume/zfs"
+	"github.com/flynn/flynn/pkg/random"
 )
 
 type ContainerSuite struct {
-	container Container
-	tty       io.ReadWriteCloser
+	id, runDir  string
+	backendName string
+	backend     Backend
+	job         *host.Job
+	container   Container
+	tty         io.ReadWriteCloser
+	vman        *volumemanager.Manager
+}
+
+func (s *ContainerSuite) setup(c *C, backendName string) {
+	if os.Getuid() != 0 {
+		c.Skip("backend tests must be run as root")
+	}
+
+	var err error
+	s.id = random.String(12)
+
+	s.runDir, err = ioutil.TempDir("", fmt.Sprintf("flynn-test-%s.", s.id))
+	c.Assert(err, IsNil)
+
+	vdevFile := filepath.Join(s.runDir, fmt.Sprintf("flynn-test-zpool-%s.vdev", s.id))
+
+	vman, err := volumemanager.New(
+		filepath.Join(s.runDir, "volumes.bolt"),
+		func() (volume.Provider, error) {
+			return zfsVolume.NewProvider(&zfsVolume.ProviderConfig{
+				DatasetName: fmt.Sprintf("flynn-test-zpool-%s", s.id),
+				Make: &zfsVolume.MakeDev{
+					BackingFilename: vdevFile,
+					Size:            int64(math.Pow(2, float64(30))),
+				},
+				WorkingDir: filepath.Join(s.runDir, "zfs"),
+			})
+		})
+	c.Assert(err, IsNil)
+
+	pwd, err := os.Getwd()
+	c.Assert(err, IsNil)
+
+	state := NewState("test-host", filepath.Join(s.runDir, "host-state.bolt"))
+
+	s.backend, err = New(backendName, Config{
+		State:    state,
+		Manager:  vman,
+		VolPath:  filepath.Join(s.runDir, "host-volumes"),
+		LogPath:  filepath.Join(s.runDir, "host-logs"),
+		InitPath: filepath.Join(pwd, "../bin/flynn-init"),
+		Mux:      logmux.New(1000),
+	})
+	c.Assert(err, IsNil)
+
+	s.job = &host.Job{
+		ID: s.id,
+		Artifact: host.Artifact{
+			URI: "https://registry.hub.docker.com?name=flynn/busybox&id=184af8860f22e7a87f1416bb12a32b20d0d2c142f719653d87809a6122b04663",
+		},
+		Config: host.ContainerConfig{
+			Entrypoint:  []string{"/bin/sh", "-"},
+			HostNetwork: true,
+			Stdin:       true,
+		},
+	}
+
+	attachWait := make(chan struct{})
+	state.AddAttacher(s.job.ID, attachWait)
+
+	err = s.backend.Run(s.job, nil)
+	c.Assert(err, IsNil)
+
+	stdinr, stdinw := io.Pipe()
+	stdoutr, stdoutw := io.Pipe()
+
+	s.tty = struct {
+		io.WriteCloser
+		io.Reader
+	}{stdinw, stdoutr}
+
+	<-attachWait
+	job := state.GetJob(s.job.ID)
+
+	attached := make(chan struct{})
+	attachReq := &AttachRequest{
+		Job:      job,
+		Height:   80,
+		Width:    80,
+		Logs:     false,
+		Stream:   true,
+		Attached: attached,
+		Stdin:    stdinr,
+		Stdout:   stdoutw,
+	}
+
+	go s.backend.Attach(attachReq)
+	<-attached
+	close(attached)
+	close(attachWait)
+
+	s.container, err = s.backend.GetContainer(s.id)
+	c.Assert(err, IsNil)
+}
+
+func (s *ContainerSuite) TearDownSuite(c *C) {
+	if os.Getuid() != 0 {
+		return
+	}
+
+	c.Assert(s.backend.Stop(s.job.ID), IsNil)
+	c.Assert(s.backend.Cleanup(), IsNil)
+
+	zpool, err := zfs.GetZpool(fmt.Sprintf("flynn-test-zpool-%s", s.id))
+	c.Assert(err, IsNil)
+
+	err = zpool.Destroy()
+	c.Assert(err, IsNil)
 }
 
 func (s *ContainerSuite) containerCapabilities() (capability.Capabilities, error) {
