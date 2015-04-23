@@ -11,20 +11,22 @@ var Cluster = createClass({
 
 	__computeInstallState: function (attrs) {
 		var prevState = this.getInstallState() || {
-			installEvents: [],
+			logEvents: [],
 			certVerified: false,
 			domainName: null,
 			caCert: null,
 			dashboardLoginToken: null,
 			prompt: null,
 			deleting: false,
-			failed: false
+			failed: false,
+			errorDismissed: false
 		};
 		var state = {
 			inProgress: false,
 			deleting: prevState.deleting,
 			failed: prevState.failed,
-			installEvents: prevState.installEvents,
+			errorDismissed: prevState.errorDismissed,
+			logEvents: prevState.logEvents,
 			steps: [
 				{ id: 'configure', label: 'Configure', complete: false },
 				{ id: 'install',   label: 'Install',   complete: false },
@@ -59,6 +61,10 @@ var Cluster = createClass({
 			case 'running':
 				state.currentStep = 'dashboard';
 			break;
+		}
+
+		if (attrs.errorDismissed) {
+			state.errorDismissed = true;
 		}
 
 		var complete = true;
@@ -111,14 +117,20 @@ var Cluster = createClass({
 
 	handleEvent: function (event) {
 		switch (event.name) {
-			case 'INSTALL_LOG':
-				this.__addInstallEvent(event.data);
+			case 'LOG':
+				this.__addLog(event.data);
 			break;
 
 			case 'INSTALL_ERROR':
-				this.__addInstallEvent({
+				this.__addLog({
 					description: 'Error: '+ event.message
 				});
+			break;
+
+			case 'INSTALL_ERROR_DISMISS':
+				this.__setInstallState(
+					this.__computeInstallState({state: 'error', errorDismissed: true})
+				);
 			break;
 
 			case 'CLUSTER_STATE':
@@ -154,11 +166,11 @@ var Cluster = createClass({
 		}
 	},
 
-	__addInstallEvent: function (data) {
-		var installEvents = [].concat(this.getInstallState().installEvents);
-		installEvents.push(data);
+	__addLog: function (data) {
+		var logEvents = [].concat(this.getInstallState().logEvents);
+		logEvents.push(data);
 		this.__setInstallState({
-			installEvents: installEvents
+			logEvents: logEvents
 		});
 	}
 });

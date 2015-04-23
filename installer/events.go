@@ -65,7 +65,7 @@ func (i *Installer) GetEventsSince(eventID string) []*Event {
 			ts = time.Unix(0, nano)
 		}
 	}
-	rows, err := i.db.Query(`SELECT ID, ClusterID, PromptID, Type, Timestamp, Description FROM events WHERE Timestamp > $1 ORDER BY Timestamp`, ts)
+	rows, err := i.db.Query(`SELECT ID, ClusterID, PromptID, Type, Timestamp, Description FROM events WHERE Timestamp > $1 AND DeletedAt IS NULL ORDER BY Timestamp`, ts)
 	if err != nil {
 		i.logger.Debug(fmt.Sprintf("GetEventsSince SQL Error: %s", err.Error()))
 		return events
@@ -76,7 +76,7 @@ func (i *Installer) GetEventsSince(eventID string) []*Event {
 			i.logger.Debug(fmt.Sprintf("GetEventsSince Scan Error: %s", err.Error()))
 			continue
 		}
-		if event.Type == "install_log" {
+		if event.Type == "log" {
 			if c, err := i.FindCluster(event.ClusterID); err != nil || (err == nil && c.State == "running") {
 				continue
 			}
@@ -90,7 +90,7 @@ func (i *Installer) GetEventsSince(eventID string) []*Event {
 		}
 		if event.PromptID != "" {
 			p := &Prompt{}
-			if err := i.db.QueryRow(`SELECT ID, Type, Message, Yes, Input, Resolved FROM prompts WHERE ID == $1`, event.PromptID, event.ClusterID).Scan(&p.ID, &p.Type, &p.Message, &p.Yes, &p.Input, &p.Resolved); err != nil {
+			if err := i.db.QueryRow(`SELECT ID, Type, Message, Yes, Input, Resolved FROM prompts WHERE ID == $1 AND DeletedAt IS NULL`, event.PromptID).Scan(&p.ID, &p.Type, &p.Message, &p.Yes, &p.Input, &p.Resolved); err != nil {
 				i.logger.Debug(fmt.Sprintf("GetEventsSince Prompt Scan Error: %s", err.Error()))
 				continue
 			}
@@ -129,14 +129,14 @@ func (i *Installer) SendEvent(event *Event) {
 	}
 }
 
-func (c *Cluster) findPrompt(id string) (*Prompt, error) {
+func (c *BaseCluster) findPrompt(id string) (*Prompt, error) {
 	if c.pendingPrompt != nil && c.pendingPrompt.ID == id {
 		return c.pendingPrompt, nil
 	}
 	return nil, errors.New("Prompt not found")
 }
 
-func (c *Cluster) sendPrompt(prompt *Prompt) *Prompt {
+func (c *BaseCluster) sendPrompt(prompt *Prompt) *Prompt {
 	c.pendingPrompt = prompt
 
 	if err := c.installer.dbInsertItem("prompts", prompt); err != nil {
@@ -168,7 +168,7 @@ func (c *Cluster) sendPrompt(prompt *Prompt) *Prompt {
 	return res
 }
 
-func (c *Cluster) dbUpdatePrompt(prompt *Prompt) error {
+func (c *BaseCluster) dbUpdatePrompt(prompt *Prompt) error {
 	c.installer.dbMtx.Lock()
 	defer c.installer.dbMtx.Unlock()
 
@@ -214,7 +214,7 @@ func (i *Installer) dbInsertItem(tableName string, item interface{}) error {
 	return tx.Commit()
 }
 
-func (c *Cluster) YesNoPrompt(msg string) bool {
+func (c *BaseCluster) YesNoPrompt(msg string) bool {
 	res := c.sendPrompt(&Prompt{
 		ID:      random.Hex(16),
 		Type:    "yes_no",
@@ -225,7 +225,7 @@ func (c *Cluster) YesNoPrompt(msg string) bool {
 	return res.Yes
 }
 
-func (c *Cluster) PromptInput(msg string) string {
+func (c *BaseCluster) PromptInput(msg string) string {
 	res := c.sendPrompt(&Prompt{
 		ID:      random.Hex(16),
 		Type:    "input",
@@ -236,19 +236,19 @@ func (c *Cluster) PromptInput(msg string) string {
 	return res.Input
 }
 
-func (c *Cluster) sendEvent(event *Event) {
+func (c *BaseCluster) sendEvent(event *Event) {
 	c.installer.SendEvent(event)
 }
 
-func (c *Cluster) SendInstallLogEvent(description string) {
+func (c *BaseCluster) SendLog(description string) {
 	c.sendEvent(&Event{
-		Type:        "install_log",
+		Type:        "log",
 		ClusterID:   c.ID,
 		Description: description,
 	})
 }
 
-func (c *Cluster) SendError(err error) {
+func (c *BaseCluster) SendError(err error) {
 	c.sendEvent(&Event{
 		Type:        "error",
 		ClusterID:   c.ID,
@@ -256,7 +256,7 @@ func (c *Cluster) SendError(err error) {
 	})
 }
 
-func (c *Cluster) handleDone() {
+func (c *BaseCluster) handleDone() {
 	if c.State != "running" {
 		return
 	}

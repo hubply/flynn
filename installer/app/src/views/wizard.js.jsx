@@ -62,8 +62,8 @@ var Wizard = React.createClass({
 							</form>
 						)}
 					</Modal>
-				) : (state.failed ? (
-					<Modal visible={true}>
+				) : (state.failed && !state.errorDismissed ? (
+					<Modal visible={true} onHide={this.__handleFailedModalHide}>
 						<header>
 							<h2>Install failed</h2>
 						</header>
@@ -85,6 +85,13 @@ var Wizard = React.createClass({
 
 	componentWillUnmount: function () {
 		this.props.dataStore.removeChangeListener(this.__handleDataChange);
+	},
+
+	__handleFailedModalHide: function () {
+		Dispatcher.dispatch({
+			name: 'INSTALL_ERROR_DISMISS',
+			clusterID: this.state.currentCluster.ID
+		});
 	},
 
 	__handleAbortBtnClick: function (e) {

@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"sync"
 
@@ -19,7 +18,7 @@ type Installer struct {
 	db            *sql.DB
 	events        []*Event
 	subscriptions []*Subscription
-	clusters      []interface{}
+	clusters      []Cluster
 	logger        log.Logger
 
 	dbMtx        sync.RWMutex
@@ -32,7 +31,7 @@ func NewInstaller(l log.Logger) *Installer {
 	installer := &Installer{
 		events:        make([]*Event, 0),
 		subscriptions: make([]*Subscription, 0),
-		clusters:      make([]interface{}, 0),
+		clusters:      make([]Cluster, 0),
 		logger:        l,
 	}
 	if err := installer.openDB(); err != nil {
@@ -64,8 +63,8 @@ func (i *Installer) launchAWSCluster(c *AWSCluster) error {
 	i.clustersMtx.Unlock()
 	i.SendEvent(&Event{
 		Type:      "new_cluster",
-		Cluster:   c.cluster,
-		ClusterID: c.cluster.ID,
+		Cluster:   c.base,
+		ClusterID: c.base.ID,
 	})
 	c.Run()
 	return nil
@@ -75,35 +74,28 @@ func (i *Installer) saveAWSCluster(c *AWSCluster) error {
 	i.dbMtx.Lock()
 	defer i.dbMtx.Unlock()
 
-	c.ClusterID = c.cluster.ID
-	c.cluster.Type = "aws"
-	c.cluster.Name = c.ClusterID
+	c.ClusterID = c.base.ID
+	c.base.Type = "aws"
+	c.base.Name = c.ClusterID
 
-	clusterFields, err := ql.Marshal(c.cluster)
-	if err != nil {
-		return err
-	}
-	awsFields, err := ql.Marshal(c)
+	clusterFields, err := ql.Marshal(c.base)
 	if err != nil {
 		return err
 	}
 	clustersVStr := make([]string, 0, len(clusterFields))
-	awsVStr := make([]string, 0, len(awsFields))
-	fields := make([]interface{}, 0, len(clusterFields)+len(awsFields))
-	for idx, f := range clusterFields {
+	for idx := range clusterFields {
 		clustersVStr = append(clustersVStr, fmt.Sprintf("$%d", idx+1))
-		fields = append(fields, f)
-	}
-	offset := len(clusterFields)
-	for idx, f := range awsFields {
-		awsVStr = append(awsVStr, fmt.Sprintf("$%d", idx+1+offset))
-		fields = append(fields, f)
 	}
 
-	list, err := ql.Compile(fmt.Sprintf(`
-		INSERT INTO clusters VALUES (%s);
-		INSERT INTO aws_clusters VALUES(%s);
-	`, strings.Join(clustersVStr, ", "), strings.Join(awsVStr, ", ")))
+	awsFields, err := ql.Marshal(c)
+	if err != nil {
+		return err
+	}
+	awsVStr := make([]string, 0, len(awsFields))
+	for idx := range awsFields {
+		awsVStr = append(awsVStr, fmt.Sprintf("$%d", idx+1))
+	}
+
 	if err != nil {
 		return err
 	}
@@ -111,8 +103,11 @@ func (i *Installer) saveAWSCluster(c *AWSCluster) error {
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(list.String(), fields...)
-	if err != nil {
+	if _, err := tx.Exec(fmt.Sprintf("INSERT INTO clusters VALUES (%s)", strings.Join(clustersVStr, ",")), clusterFields...); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if _, err := tx.Exec(fmt.Sprintf("INSERT INTO aws_clusters VALUES (%s)", strings.Join(awsVStr, ",")), awsFields...); err != nil {
 		tx.Rollback()
 		return err
 	}
@@ -148,30 +143,30 @@ func (i *Installer) FindAWSCredentials(id string) (aws.CredentialsProvider, erro
 	return aws.Creds(id, secret, ""), nil
 }
 
-func (i *Installer) FindCluster(id string) (*Cluster, error) {
+func (i *Installer) FindCluster(id string) (*BaseCluster, error) {
 	i.clustersMtx.RLock()
 	for _, c := range i.clusters {
 		if cluster, ok := c.(*AWSCluster); ok {
 			if cluster.ClusterID == id {
 				i.clustersMtx.RUnlock()
-				return cluster.cluster, nil
+				return cluster.base, nil
 			}
 		}
 	}
 	i.clustersMtx.RUnlock()
 
-	c := &Cluster{ID: id, installer: i}
+	c := &BaseCluster{ID: id, installer: i}
 
 	err := i.db.QueryRow(`
-	SELECT CredentialID, Type, State, NumInstances, ControllerKey, ControllerPin, DashboardLoginToken, CACert, SSHKeyName, VpcCidr, SubnetCidr, DiscoveryToken, DNSZoneID FROM clusters WHERE ID == $1 LIMIT 1
-  `, c.ID).Scan(&c.CredentialID, &c.Type, &c.State, &c.NumInstances, &c.ControllerKey, &c.ControllerPin, &c.DashboardLoginToken, &c.CACert, &c.SSHKeyName, &c.VpcCidr, &c.SubnetCidr, &c.DiscoveryToken, &c.DNSZoneID)
+	SELECT CredentialID, Type, State, NumInstances, ControllerKey, ControllerPin, DashboardLoginToken, CACert, SSHKeyName, VpcCIDR, SubnetCIDR, DiscoveryToken, DNSZoneID FROM clusters WHERE ID == $1 AND DeletedAt IS NULL LIMIT 1
+  `, c.ID).Scan(&c.CredentialID, &c.Type, &c.State, &c.NumInstances, &c.ControllerKey, &c.ControllerPin, &c.DashboardLoginToken, &c.CACert, &c.SSHKeyName, &c.VpcCIDR, &c.SubnetCIDR, &c.DiscoveryToken, &c.DNSZoneID)
 	if err != nil {
 		return nil, err
 	}
 
 	domain := &Domain{ClusterID: c.ID}
 	err = i.db.QueryRow(`
-  SELECT Name, Token FROM domains WHERE ClusterID == $1 LIMIT 1
+  SELECT Name, Token FROM domains WHERE ClusterID == $1 AND DeletedAt IS NULL LIMIT 1
   `, c.ID).Scan(&domain.Name, &domain.Token)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err
@@ -180,8 +175,8 @@ func (i *Installer) FindCluster(id string) (*Cluster, error) {
 		c.Domain = domain
 	}
 
-	instanceIPs := make([]string, 0)
-	rows, err := i.db.Query(`SELECT IP FROM instances WHERE ClusterID == $1`, c.ID)
+	var instanceIPs []string
+	rows, err := i.db.Query(`SELECT IP FROM instances WHERE ClusterID == $1 AND DeletedAt IS NULL`, c.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +188,6 @@ func (i *Installer) FindCluster(id string) (*Cluster, error) {
 			return nil, err
 		}
 	}
-	fmt.Sprintf("FindCluster InstanceIPs: %v\n", instanceIPs)
 	c.InstanceIPs = instanceIPs
 
 	return c, nil
@@ -217,12 +211,12 @@ func (i *Installer) FindAWSCluster(id string) (*AWSCluster, error) {
 	}
 
 	awsCluster := &AWSCluster{
-		cluster: cluster,
+		base: cluster,
 	}
 
 	err = i.db.QueryRow(`
-	SELECT StackID, StackName, ImageID, Region, InstanceType, VpcCidr, SubnetCidr, DNSZoneID FROM aws_clusters WHERE ClusterID == $1 LIMIT 1
-  `, cluster.ID).Scan(&awsCluster.StackID, &awsCluster.StackName, &awsCluster.ImageID, &awsCluster.Region, &awsCluster.InstanceType, &awsCluster.VpcCidr, &awsCluster.SubnetCidr, &awsCluster.DNSZoneID)
+	SELECT StackID, StackName, ImageID, Region, InstanceType, VpcCIDR, SubnetCIDR, DNSZoneID FROM aws_clusters WHERE ClusterID == $1 AND DeletedAt IS NULL LIMIT 1
+  `, cluster.ID).Scan(&awsCluster.StackID, &awsCluster.StackName, &awsCluster.ImageID, &awsCluster.Region, &awsCluster.InstanceType, &awsCluster.VpcCIDR, &awsCluster.SubnetCIDR, &awsCluster.DNSZoneID)
 	if err != nil {
 		return nil, err
 	}
@@ -241,23 +235,18 @@ func (i *Installer) DeleteCluster(id string) error {
 	if err != nil {
 		return err
 	}
-	awsCluster.Delete()
+	go awsCluster.Delete()
 	return nil
 }
 
 func (i *Installer) ClusterDeleted(id string) {
 	i.clustersMtx.Lock()
-	clusters := make([]interface{}, 0, len(i.clusters))
+	defer i.clustersMtx.Unlock()
+	clusters := make([]Cluster, 0, len(i.clusters))
 	for _, c := range i.clusters {
-		idValue := reflect.Indirect(reflect.ValueOf(c)).FieldByName("ID")
-		if !idValue.IsValid() {
-			continue
-		}
-		cID := idValue.Interface().(string)
-		if cID != id {
+		if c.Base().ID != id {
 			clusters = append(clusters, c)
 		}
 	}
 	i.clusters = clusters
-	i.clustersMtx.Unlock()
 }

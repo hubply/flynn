@@ -25,11 +25,15 @@ var DisallowedEC2InstanceTypes = []string{"t1.micro", "t2.micro", "t2.small", "m
 var DefaultInstanceType = "m3.medium"
 var StackNotFoundError = errors.New("Stack does not exist")
 
-func (c *AWSCluster) saveField(field string, value interface{}) error {
-	c.cluster.installer.dbMtx.Lock()
-	defer c.cluster.installer.dbMtx.Unlock()
+func (c *AWSCluster) Base() *BaseCluster {
+	return c.base
+}
 
-	tx, err := c.cluster.installer.db.Begin()
+func (c *AWSCluster) saveField(field string, value interface{}) error {
+	c.base.installer.dbMtx.Lock()
+	defer c.base.installer.dbMtx.Unlock()
+
+	tx, err := c.base.installer.db.Begin()
 	if err != nil {
 		return err
 	}
@@ -48,19 +52,19 @@ func (c *AWSCluster) SetDefaultsAndValidate() error {
 		c.InstanceType = DefaultInstanceType
 	}
 
-	if c.VpcCidr == "" {
-		c.VpcCidr = "10.0.0.0/16"
+	if c.VpcCIDR == "" {
+		c.VpcCIDR = "10.0.0.0/16"
 	}
 
-	if c.SubnetCidr == "" {
-		c.SubnetCidr = "10.0.0.0/21"
+	if c.SubnetCIDR == "" {
+		c.SubnetCIDR = "10.0.0.0/21"
 	}
 
 	if err := c.validateInputs(); err != nil {
 		return err
 	}
 
-	if err := c.cluster.SetDefaultsAndValidate(); err != nil {
+	if err := c.base.SetDefaultsAndValidate(); err != nil {
 		return err
 	}
 
@@ -86,12 +90,12 @@ func (c *AWSCluster) validateInputs() error {
 func (c *AWSCluster) Run() {
 	go func() {
 		defer func() {
-			c.cluster.handleDone()
+			c.base.handleDone()
 		}()
 
 		steps := []func() error{
 			c.createKeyPair,
-			c.cluster.allocateDomain,
+			c.base.allocateDomain,
 			c.fetchImageID,
 			c.createStack,
 			c.fetchStackOutputs,
@@ -101,49 +105,46 @@ func (c *AWSCluster) Run() {
 
 		for _, step := range steps {
 			if err := step(); err != nil {
-				if c.cluster.State != "deleting" {
-					c.cluster.setState("error")
-					c.cluster.SendError(err)
+				if c.base.State != "deleting" {
+					c.base.setState("error")
+					c.base.SendError(err)
 				}
 				return
 			}
 		}
 
-		c.cluster.setState("running")
+		c.base.setState("running")
 
-		if err := c.cluster.configureCLI(); err != nil {
-			c.cluster.SendInstallLogEvent(fmt.Sprintf("WARNING: Failed to configure CLI: %s", err))
+		if err := c.base.configureCLI(); err != nil {
+			c.base.SendLog(fmt.Sprintf("WARNING: Failed to configure CLI: %s", err))
 		}
 	}()
 }
 
 func (c *AWSCluster) Delete() {
 	c.cf = cloudformation.New(c.creds, c.Region, nil)
-	go func() {
-		stackEventsSince := time.Now()
-		c.cluster.setState("deleting")
-		if err := c.fetchStack(); err != StackNotFoundError {
-			fmt.Println(err)
-			if err := c.cf.DeleteStack(&cloudformation.DeleteStackInput{
-				StackName: aws.String(c.StackName),
-			}); err != nil {
-				c.cluster.setState("error")
-				c.cluster.SendError(fmt.Errorf("Unable to delete stack %s: %s", c.StackName, err))
-			} else {
-				if err := c.waitForStackCompletion("DELETE", stackEventsSince); err != nil {
-					c.cluster.SendError(err)
-				}
+	stackEventsSince := time.Now()
+	c.base.setState("deleting")
+	if err := c.fetchStack(); err != StackNotFoundError {
+		if err := c.cf.DeleteStack(&cloudformation.DeleteStackInput{
+			StackName: aws.String(c.StackName),
+		}); err != nil {
+			c.base.setState("error")
+			c.base.SendError(fmt.Errorf("Unable to delete stack %s: %s", c.StackName, err))
+		} else {
+			if err := c.waitForStackCompletion("DELETE", stackEventsSince); err != nil {
+				c.base.SendError(err)
 			}
 		}
-		if err := c.cluster.RemoveFromDB(); err != nil {
-			c.cluster.SendError(err)
-		}
-		c.cluster.sendEvent(&Event{
-			ClusterID:   c.cluster.ID,
-			Type:        "cluster_state",
-			Description: "deleted",
-		})
-	}()
+	}
+	if err := c.base.MarkDeleted(); err != nil {
+		c.base.SendError(err)
+	}
+	c.base.sendEvent(&Event{
+		ClusterID:   c.base.ID,
+		Type:        "cluster_state",
+		Description: "deleted",
+	})
 }
 
 func (c *AWSCluster) loadKeyPair(name string) error {
@@ -169,28 +170,28 @@ func (c *AWSCluster) loadKeyPair(name string) error {
 	if len(res.KeyPairs) == 0 {
 		return errors.New("No matching key found")
 	}
-	c.cluster.SSHKey = keypair
+	c.base.SSHKey = keypair
 	for _, p := range res.KeyPairs {
 		if *p.KeyName == name {
-			c.cluster.SSHKeyName = name
+			c.base.SSHKeyName = name
 			return nil
 		}
 	}
-	c.cluster.SSHKeyName = *res.KeyPairs[0].KeyName
-	return saveSSHKey(c.cluster.SSHKeyName, keypair)
+	c.base.SSHKeyName = *res.KeyPairs[0].KeyName
+	return saveSSHKey(c.base.SSHKeyName, keypair)
 }
 
 func (c *AWSCluster) createKeyPair() error {
 	keypairName := "flynn"
-	if c.cluster.SSHKeyName != "" {
-		keypairName = c.cluster.SSHKeyName
+	if c.base.SSHKeyName != "" {
+		keypairName = c.base.SSHKeyName
 	}
 	if err := c.loadKeyPair(keypairName); err == nil {
-		c.cluster.SendInstallLogEvent(fmt.Sprintf("Using saved key pair (%s)", c.cluster.SSHKeyName))
+		c.base.SendLog(fmt.Sprintf("Using saved key pair (%s)", c.base.SSHKeyName))
 		return nil
 	}
 
-	c.cluster.SendInstallLogEvent("Creating key pair")
+	c.base.SendLog("Creating key pair")
 	keypair, err := sshkeygen.Generate()
 	if err != nil {
 		return err
@@ -205,8 +206,8 @@ func (c *AWSCluster) createKeyPair() error {
 		PublicKeyMaterial: publicKeyBytes,
 	})
 	if apiErr, ok := err.(aws.APIError); ok && apiErr.Code == "InvalidKeyPair.Duplicate" {
-		if c.cluster.YesNoPrompt(fmt.Sprintf("Key pair %s already exists, would you like to delete it?", keypairName)) {
-			c.cluster.SendInstallLogEvent("Deleting key pair")
+		if c.base.YesNoPrompt(fmt.Sprintf("Key pair %s already exists, would you like to delete it?", keypairName)) {
+			c.base.SendLog("Deleting key pair")
 			if err := c.ec2.DeleteKeyPair(&ec2.DeleteKeyPairRequest{
 				KeyName: aws.String(keypairName),
 			}); err != nil {
@@ -215,9 +216,9 @@ func (c *AWSCluster) createKeyPair() error {
 			return c.createKeyPair()
 		} else {
 			for {
-				keypairName = c.cluster.PromptInput("Please enter a new key pair name")
+				keypairName = c.base.PromptInput("Please enter a new key pair name")
 				if keypairName != "" {
-					c.cluster.SSHKeyName = keypairName
+					c.base.SSHKeyName = keypairName
 					return c.createKeyPair()
 				}
 			}
@@ -227,8 +228,8 @@ func (c *AWSCluster) createKeyPair() error {
 		return err
 	}
 
-	c.cluster.SSHKey = keypair
-	c.cluster.SSHKeyName = *res.KeyName
+	c.base.SSHKey = keypair
+	c.base.SSHKeyName = *res.KeyName
 
 	err = saveSSHKey(keypairName, keypair)
 	if err != nil {
@@ -242,16 +243,16 @@ func (c *AWSCluster) fetchImageID() (err error) {
 		if err == nil {
 			return
 		}
-		c.cluster.SendInstallLogEvent(err.Error())
+		c.base.SendLog(err.Error())
 		if c.ImageID != "" {
-			c.cluster.SendInstallLogEvent("Falling back to saved Image ID")
+			c.base.SendLog("Falling back to saved Image ID")
 			err = nil
 			return
 		}
 		return
 	}()
 
-	c.cluster.SendInstallLogEvent("Fetching image manifest")
+	c.base.SendLog("Fetching image manifest")
 
 	latestImages, err := c.fetchLatestEC2Images()
 	if err != nil {
@@ -275,18 +276,16 @@ func (c *AWSCluster) fetchImageID() (err error) {
 }
 
 func (c *AWSCluster) fetchLatestEC2Images() ([]*release.EC2Image, error) {
-	client := &http.Client{}
-	resp, err := client.Get("https://dl.flynn.io/ec2/images.json")
+	res, err := http.Get("https://dl.flynn.io/ec2/images.json")
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, errors.New(fmt.Sprintf("Failed to fetch list of flynn images: %s", resp.Status))
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, errors.New(fmt.Sprintf("Failed to fetch list of flynn images: %s", res.Status))
 	}
-	dec := json.NewDecoder(resp.Body)
 	manifest := release.EC2Manifest{}
-	err = dec.Decode(&manifest)
-	if err != nil {
+	if err := json.NewDecoder(res.Body).Decode(&manifest); err != nil {
 		return nil, err
 	}
 	if len(manifest.Versions) == 0 {
@@ -301,19 +300,19 @@ type stackTemplateData struct {
 }
 
 func (c *AWSCluster) createStack() error {
-	c.cluster.SendInstallLogEvent("Generating start script")
-	startScript, discoveryToken, err := c.cluster.genStartScript(c.cluster.NumInstances)
+	c.base.SendLog("Generating start script")
+	startScript, discoveryToken, err := c.base.genStartScript(c.base.NumInstances)
 	if err != nil {
 		return err
 	}
-	c.cluster.DiscoveryToken = discoveryToken
-	if err := c.cluster.saveField("DiscoveryToken", discoveryToken); err != nil {
+	c.base.DiscoveryToken = discoveryToken
+	if err := c.base.saveField("DiscoveryToken", discoveryToken); err != nil {
 		return err
 	}
 
 	var stackTemplateBuffer bytes.Buffer
 	err = stackTemplate.Execute(&stackTemplateBuffer, &stackTemplateData{
-		Instances:           make([]struct{}, c.cluster.NumInstances),
+		Instances:           make([]struct{}, c.base.NumInstances),
 		DefaultInstanceType: DefaultInstanceType,
 	})
 	if err != nil {
@@ -328,11 +327,11 @@ func (c *AWSCluster) createStack() error {
 		},
 		{
 			ParameterKey:   aws.String("ClusterDomain"),
-			ParameterValue: aws.String(c.cluster.Domain.Name),
+			ParameterValue: aws.String(c.base.Domain.Name),
 		},
 		{
 			ParameterKey:   aws.String("KeyName"),
-			ParameterValue: aws.String(c.cluster.SSHKeyName),
+			ParameterValue: aws.String(c.base.SSHKeyName),
 		},
 		{
 			ParameterKey:   aws.String("UserData"),
@@ -344,11 +343,11 @@ func (c *AWSCluster) createStack() error {
 		},
 		{
 			ParameterKey:   aws.String("VpcCidrBlock"),
-			ParameterValue: aws.String(c.VpcCidr),
+			ParameterValue: aws.String(c.VpcCIDR),
 		},
 		{
 			ParameterKey:   aws.String("SubnetCidrBlock"),
-			ParameterValue: aws.String(c.SubnetCidr),
+			ParameterValue: aws.String(c.SubnetCIDR),
 		},
 	}
 
@@ -356,18 +355,18 @@ func (c *AWSCluster) createStack() error {
 
 	if c.StackID != "" && c.StackName != "" {
 		if err := c.fetchStack(); err == nil && !strings.HasPrefix(*c.stack.StackStatus, "DELETE") {
-			if c.cluster.YesNoPrompt(fmt.Sprintf("Stack found from previous installation (%s), would you like to delete it? (a new one will be created either way)", c.StackName)) {
-				c.cluster.SendInstallLogEvent(fmt.Sprintf("Deleting stack %s", c.StackName))
+			if c.base.YesNoPrompt(fmt.Sprintf("Stack found from previous installation (%s), would you like to delete it? (a new one will be created either way)", c.StackName)) {
+				c.base.SendLog(fmt.Sprintf("Deleting stack %s", c.StackName))
 				if err := c.cf.DeleteStack(&cloudformation.DeleteStackInput{
 					StackName: aws.String(c.StackName),
 				}); err != nil {
-					c.cluster.SendInstallLogEvent(fmt.Sprintf("Unable to delete stack %s: %s", c.StackName, err))
+					c.base.SendLog(fmt.Sprintf("Unable to delete stack %s: %s", c.StackName, err))
 				}
 			}
 		}
 	}
 
-	c.cluster.SendInstallLogEvent("Creating stack")
+	c.base.SendLog("Creating stack")
 	res, err := c.cf.CreateStack(&cloudformation.CreateStackInput{
 		OnFailure:        aws.String("DELETE"),
 		StackName:        aws.String(c.StackName),
@@ -404,13 +403,13 @@ func (e StackEventSort) Less(i, j int) bool {
 func (c *AWSCluster) waitForStackCompletion(action string, after time.Time) error {
 	stackID := aws.String(c.StackID)
 
-	actionCompleteSuffix := "_COMPLETE"
-	actionFailureSuffix := "_FAILED"
-	actionInProgressSuffix := "_IN_PROGRESS"
+	const actionCompleteSuffix = "_COMPLETE"
+	const actionFailureSuffix = "_FAILED"
+	const actionInProgressSuffix = "_IN_PROGRESS"
 	isComplete := false
 	isFailed := false
 
-	stackEvents := make([]cloudformation.StackEvent, 0)
+	var stackEvents []cloudformation.StackEvent
 	var nextToken aws.StringValue
 
 	var fetchStackEvents func() error
@@ -470,7 +469,7 @@ func (c *AWSCluster) waitForStackCompletion(action string, after time.Time) erro
 				if se.LogicalResourceID != nil {
 					name = fmt.Sprintf("%s (%s)", name, *se.LogicalResourceID)
 				}
-				c.cluster.SendInstallLogEvent(fmt.Sprintf("%s\t%s%s", name, *se.ResourceStatus, desc))
+				c.base.SendLog(fmt.Sprintf("%s\t%s%s", name, *se.ResourceStatus, desc))
 			}
 		}
 		if res.NextToken != nil {
@@ -500,7 +499,7 @@ func (c *AWSCluster) waitForStackCompletion(action string, after time.Time) erro
 func (c *AWSCluster) fetchStack() error {
 	stackID := aws.String(c.StackID)
 
-	c.cluster.SendInstallLogEvent("Fetching stack")
+	c.base.SendLog("Fetching stack")
 	res, err := c.cf.DescribeStacks(&cloudformation.DescribeStacksInput{
 		StackName: stackID,
 	})
@@ -521,7 +520,7 @@ func (c *AWSCluster) fetchStack() error {
 func (c *AWSCluster) fetchStackOutputs() error {
 	c.fetchStack()
 
-	instanceIPs := make([]string, 0, c.cluster.NumInstances)
+	instanceIPs := make([]string, 0, c.base.NumInstances)
 	for _, o := range c.stack.Outputs {
 		v := *o.OutputValue
 		if strings.HasPrefix(*o.OutputKey, "IPAddress") {
@@ -531,10 +530,10 @@ func (c *AWSCluster) fetchStackOutputs() error {
 			c.DNSZoneID = v
 		}
 	}
-	if int64(len(instanceIPs)) != c.cluster.NumInstances {
-		return fmt.Errorf("expected stack outputs to include %d instance IPs but found %d", c.cluster.NumInstances, len(instanceIPs))
+	if int64(len(instanceIPs)) != c.base.NumInstances {
+		return fmt.Errorf("expected stack outputs to include %d instance IPs but found %d", c.base.NumInstances, len(instanceIPs))
 	}
-	c.cluster.InstanceIPs = instanceIPs
+	c.base.InstanceIPs = instanceIPs
 
 	if c.DNSZoneID == "" {
 		return fmt.Errorf("stack outputs do not include DNSZoneID")
@@ -543,7 +542,7 @@ func (c *AWSCluster) fetchStackOutputs() error {
 	if err := c.saveField("DNSZoneID", c.DNSZoneID); err != nil {
 		return err
 	}
-	if err := c.cluster.saveField("InstanceIPs", c.cluster.InstanceIPs); err != nil {
+	if err := c.base.saveInstanceIPs(); err != nil {
 		return err
 	}
 
@@ -552,7 +551,7 @@ func (c *AWSCluster) fetchStackOutputs() error {
 
 func (c *AWSCluster) configureDNS() error {
 	// TODO(jvatic): Run directly after receiving zone create complete stack event
-	c.cluster.SendInstallLogEvent("Configuring DNS")
+	c.base.SendLog("Configuring DNS")
 
 	// Set region to us-east-1, since any other region will fail for global services like Route53
 	r53 := route53.New(c.creds, "us-east-1", nil)
@@ -560,7 +559,7 @@ func (c *AWSCluster) configureDNS() error {
 	if err != nil {
 		return err
 	}
-	if err := c.cluster.Domain.Configure(res.DelegationSet.NameServers); err != nil {
+	if err := c.base.Domain.Configure(res.DelegationSet.NameServers); err != nil {
 		return err
 	}
 	return nil
@@ -570,5 +569,5 @@ func (c *AWSCluster) bootstrap() error {
 	if c.stack == nil {
 		return errors.New("No stack found")
 	}
-	return c.cluster.bootstrap()
+	return c.base.bootstrap()
 }

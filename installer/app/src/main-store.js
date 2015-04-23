@@ -80,12 +80,6 @@ export default createClass({
 		}
 	},
 
-	handleInstallEvent: function (data) {
-		this.setState({
-			installEvents: this.state.installEvents.concat([data])
-		});
-	},
-
 	launchAWS: function (inputs) {
 		var cluster = new Cluster({});
 		cluster.creds = inputs.creds;

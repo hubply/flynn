@@ -78,10 +78,18 @@ var Client = {
 		if (this.__es && this.__es.readyState !== 2) {
 			return false;
 		}
+		var retryConnection = function () {
+			var attempts = this.__retryEventStreamAttempts || 0;
+			if (attempts < 3) {
+				this.__retryEventStreamAttempts = attempts + 1;
+				this.openEventStream();
+			}
+		}.bind(this);
 		var es = this.__es = new EventSource(Config.endpoints.events);
 		es.addEventListener('error', function (e) {
 			window.console.error('event stream error: ', e);
 			es.close();
+			retryConnection();
 		}, false);
 		es.addEventListener('message', function (e) {
 			var data = JSON.parse(e.data);
@@ -119,8 +127,8 @@ var Client = {
 					event.message = data.description;
 				break;
 
-				case 'install_log':
-					event.name = 'INSTALL_LOG';
+				case 'log':
+					event.name = 'LOG';
 					event.data = data;
 				break;
 

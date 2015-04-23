@@ -1,7 +1,7 @@
 var InstallProgress = React.createClass({
 	render: function () {
 		var eventNodes = [];
-		var events = this.state.installEvents;
+		var events = this.state.logEvents;
 		for (var len = events.length, i = 0; i < len; i++) {
 			eventNodes.push(
 				<div key={i}>
@@ -22,6 +22,11 @@ var InstallProgress = React.createClass({
 
 	getInitialState: function () {
 		return this.__getState();
+	},
+
+	componentDidMount: function () {
+		var node = this.refs.scrollable.getDOMNode();
+		node.scrollTop = node.scrollHeight;
 	},
 
 	componentWillReceiveProps: function () {

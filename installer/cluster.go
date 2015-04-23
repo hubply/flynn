@@ -18,40 +18,32 @@ import (
 	"github.com/flynn/flynn/pkg/etcdcluster"
 )
 
-func (c *Cluster) saveField(field string, value interface{}) error {
+func (c *BaseCluster) saveField(field string, value interface{}) error {
 	c.installer.dbMtx.Lock()
 	defer c.installer.dbMtx.Unlock()
-
-	var err error
 
 	tx, err := c.installer.db.Begin()
 	if err != nil {
 		return err
 	}
-
-	switch field {
-	case "InstanceIPs":
-		insertStmt := ""
-		fields := make([]interface{}, 0, len(c.InstanceIPs)+1)
-		fields = append(fields, c.ID)
-		for i, ip := range c.InstanceIPs {
-			insertStmt += fmt.Sprintf("INSERT INTO instances (ClusterID, IP) VALUES ($1, $%d);\n", i+2)
-			fields = append(fields, ip)
-		}
-		q := fmt.Sprintf(`
-    %s
-    `, insertStmt)
-		_, err = tx.Exec(q, fields...)
-	case "Domain":
-		_, err = tx.Exec(`
-    INSERT INTO domains (ClusterID, Name, Token) VALUES ($1, $2, $3);
-    `, c.ID, c.Domain.Name, c.Domain.Token)
-	default:
-		_, err = tx.Exec(fmt.Sprintf(`
-    UPDATE clusters SET %s = $2 WHERE ID == $1;
-    `, field), c.ID, value)
+	if _, err := tx.Exec(fmt.Sprintf("UPDATE clusters SET %s = $2 WHERE ID == $1", field), c.ID, value); err != nil {
+		tx.Rollback()
+		return err
 	}
+	return tx.Commit()
+}
 
+func (c *BaseCluster) saveDomain() error {
+	c.installer.dbMtx.Lock()
+	defer c.installer.dbMtx.Unlock()
+
+	tx, err := c.installer.db.Begin()
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`
+  INSERT INTO domains (ClusterID, Name, Token) VALUES ($1, $2, $3);
+  `, c.ID, c.Domain.Name, c.Domain.Token)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -59,7 +51,25 @@ func (c *Cluster) saveField(field string, value interface{}) error {
 	return tx.Commit()
 }
 
-func (c *Cluster) setState(state string) {
+func (c *BaseCluster) saveInstanceIPs() error {
+	c.installer.dbMtx.Lock()
+	defer c.installer.dbMtx.Unlock()
+
+	tx, err := c.installer.db.Begin()
+	if err != nil {
+		return err
+	}
+	insertStmt := "INSERT INTO instances (ClusterID, IP) VALUES ($1, $2)"
+	for _, ip := range c.InstanceIPs {
+		if _, err := tx.Exec(insertStmt, c.ID, ip); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (c *BaseCluster) setState(state string) {
 	c.State = state
 	if err := c.saveField("State", state); err != nil {
 		c.installer.logger.Debug(fmt.Sprintf("Error saving cluster State: %s", err.Error()))
@@ -71,49 +81,51 @@ func (c *Cluster) setState(state string) {
 	})
 }
 
-func (c *Cluster) RemoveFromDB() (err error) {
+func (c *BaseCluster) MarkDeleted() (err error) {
+	c.installer.dbMtx.Lock()
+	defer c.installer.dbMtx.Unlock()
+
 	var tx *sql.Tx
 	tx, err = c.installer.db.Begin()
 	if err != nil {
 		return
 	}
 
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-			return
-		}
-		err = tx.Commit()
-	}()
-
-	if _, err = tx.Exec(`DELETE FROM prompts WHERE ID IN (SELECT PromptID FROM events WHERE ClusterID == $1)`, c.ID); err != nil {
+	if _, err = tx.Exec(`UPDATE prompts SET DeletedAt = now() WHERE ID IN (SELECT PromptID FROM events WHERE ClusterID == $1)`, c.ID); err != nil {
+		tx.Rollback()
 		return
 	}
 
-	if _, err = tx.Exec(`DELETE FROM events WHERE ClusterID == $1`, c.ID); err != nil {
+	if _, err = tx.Exec(`UPDATE events SET DeletedAt = now() WHERE ClusterID == $1`, c.ID); err != nil {
+		tx.Rollback()
 		return
 	}
 
-	if _, err = tx.Exec(`DELETE FROM domains WHERE ClusterID == $1`, c.ID); err != nil {
+	if _, err = tx.Exec(`UPDATE domains SET DeletedAt = now() WHERE ClusterID == $1`, c.ID); err != nil {
+		tx.Rollback()
 		return
 	}
 
-	if _, err = tx.Exec(`DELETE FROM instances WHERE ClusterID == $1`, c.ID); err != nil {
+	if _, err = tx.Exec(`UPDATE instances SET DeletedAt = now() WHERE ClusterID == $1`, c.ID); err != nil {
+		tx.Rollback()
 		return
 	}
 
-	if _, err = tx.Exec(`DELETE FROM clusters WHERE ID == $1`, c.ID); err != nil {
+	if _, err = tx.Exec(`UPDATE clusters SET DeletedAt = now() WHERE ID == $1`, c.ID); err != nil {
+		tx.Rollback()
 		return
 	}
 
-	if _, err = tx.Exec(`DELETE FROM aws_clusters WHERE ClusterID == $1`, c.ID); err != nil {
+	if _, err = tx.Exec(`UPDATE aws_clusters SET DeletedAt = now() WHERE ClusterID == $1`, c.ID); err != nil {
+		tx.Rollback()
 		return
 	}
 	c.installer.ClusterDeleted(c.ID)
+	err = tx.Commit()
 	return
 }
 
-func (c *Cluster) SetDefaultsAndValidate() error {
+func (c *BaseCluster) SetDefaultsAndValidate() error {
 	if c.NumInstances == 0 {
 		c.NumInstances = 1
 	}
@@ -121,7 +133,7 @@ func (c *Cluster) SetDefaultsAndValidate() error {
 	return c.validateInputs()
 }
 
-func (c *Cluster) validateInputs() error {
+func (c *BaseCluster) validateInputs() error {
 	if c.NumInstances <= 0 {
 		return fmt.Errorf("You must specify at least one instance")
 	}
@@ -137,14 +149,14 @@ func (c *Cluster) validateInputs() error {
 	return nil
 }
 
-func (c *Cluster) StackAddCmd() (string, error) {
+func (c *BaseCluster) StackAddCmd() (string, error) {
 	if c.ControllerKey == "" || c.ControllerPin == "" || c.Domain == nil || c.Domain.Name == "" {
 		return "", fmt.Errorf("Not enough data present")
 	}
 	return fmt.Sprintf("flynn cluster add -g %[1]s:2222 -p %[2]s default https://controller.%[1]s %[3]s", c.Domain.Name, c.ControllerPin, c.ControllerKey), nil
 }
 
-func (c *Cluster) ClusterConfig() *cfg.Cluster {
+func (c *BaseCluster) ClusterConfig() *cfg.Cluster {
 	return &cfg.Cluster{
 		Name:    c.Name,
 		URL:     "https://controller." + c.Domain.Name,
@@ -154,22 +166,22 @@ func (c *Cluster) ClusterConfig() *cfg.Cluster {
 	}
 }
 
-func (c *Cluster) DashboardLoginMsg() (string, error) {
+func (c *BaseCluster) DashboardLoginMsg() (string, error) {
 	if c.DashboardLoginToken == "" || c.Domain == nil || c.Domain.Name == "" {
 		return "", fmt.Errorf("Not enough data present")
 	}
 	return fmt.Sprintf("The built-in dashboard can be accessed at http://dashboard.%s with login token %s", c.Domain.Name, c.DashboardLoginToken), nil
 }
 
-func (c *Cluster) allocateDomain() error {
-	c.SendInstallLogEvent("Allocating domain")
+func (c *BaseCluster) allocateDomain() error {
+	c.SendLog("Allocating domain")
 	domain, err := AllocateDomain()
 	if err != nil {
 		return err
 	}
 	domain.ClusterID = c.ID
 	c.Domain = domain
-	return c.saveField("Domain", domain)
+	return c.saveDomain()
 }
 
 func instanceRunCmd(cmd string, sshConfig *ssh.ClientConfig, ipAddress string) (stdout, stderr io.Reader, err error) {
@@ -200,13 +212,13 @@ func instanceRunCmd(cmd string, sshConfig *ssh.ClientConfig, ipAddress string) (
 	return
 }
 
-func (c *Cluster) uploadDebugInfo(sshConfig *ssh.ClientConfig, ipAddress string) {
+func (c *BaseCluster) uploadDebugInfo(sshConfig *ssh.ClientConfig, ipAddress string) {
 	cmd := "sudo flynn-host collect-debug-info"
 	stdout, stderr, _ := instanceRunCmd(cmd, sshConfig, ipAddress)
 	var buf bytes.Buffer
 	io.Copy(&buf, stdout)
 	io.Copy(&buf, stderr)
-	c.SendInstallLogEvent(fmt.Sprintf("`%s` output for %s: %s", cmd, ipAddress, buf.String()))
+	c.SendLog(fmt.Sprintf("`%s` output for %s: %s", cmd, ipAddress, buf.String()))
 }
 
 type stepInfo struct {
@@ -218,8 +230,8 @@ type stepInfo struct {
 	Timestamp time.Time        `json:"ts"`
 }
 
-func (c *Cluster) bootstrap() error {
-	c.SendInstallLogEvent("Running bootstrap")
+func (c *BaseCluster) bootstrap() error {
+	c.SendLog("Running bootstrap")
 
 	if c.SSHKey == nil {
 		return errors.New("No SSHKey found")
@@ -295,7 +307,7 @@ func (c *Cluster) bootstrap() error {
 			c.uploadDebugInfo(sshConfig, ipAddress)
 			return fmt.Errorf("bootstrap: %s %s error: %s", step.ID, step.Action, step.Error)
 		}
-		c.SendInstallLogEvent(fmt.Sprintf("%s: %s", step.ID, step.State))
+		c.SendLog(fmt.Sprintf("%s: %s", step.ID, step.State))
 		if step.State != "done" {
 			continue
 		}
@@ -348,8 +360,8 @@ func (c *Cluster) bootstrap() error {
 	return nil
 }
 
-func (c *Cluster) waitForDNS() error {
-	c.SendInstallLogEvent("Waiting for DNS to propagate")
+func (c *BaseCluster) waitForDNS() error {
+	c.SendLog("Waiting for DNS to propagate")
 	for {
 		status, err := c.Domain.Status()
 		if err != nil {
@@ -360,11 +372,11 @@ func (c *Cluster) waitForDNS() error {
 		}
 		time.Sleep(time.Second)
 	}
-	c.SendInstallLogEvent("DNS is live")
+	c.SendLog("DNS is live")
 	return nil
 }
 
-func (c *Cluster) configureCLI() error {
+func (c *BaseCluster) configureCLI() error {
 	config, err := cfg.ReadFile(cfg.DefaultPath())
 	if err != nil && !os.IsNotExist(err) {
 		return err
@@ -376,11 +388,11 @@ func (c *Cluster) configureCLI() error {
 	if err := config.SaveTo(cfg.DefaultPath()); err != nil {
 		return err
 	}
-	c.SendInstallLogEvent("CLI configured locally")
+	c.SendLog("CLI configured locally")
 	return nil
 }
 
-func (c *Cluster) genStartScript(nodes int64) (string, string, error) {
+func (c *BaseCluster) genStartScript(nodes int64) (string, string, error) {
 	var data struct {
 		DiscoveryToken string
 	}

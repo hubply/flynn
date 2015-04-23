@@ -41,8 +41,8 @@ type jsonInput struct {
 	Region       string         `json:"region"`
 	InstanceType string         `json:"instance_type"`
 	NumInstances int64          `json:"num_instances"`
-	VpcCidr      string         `json:"vpc_cidr,omitempty"`
-	SubnetCidr   string         `json:"subnet_cidr,omitempty"`
+	VpcCIDR      string         `json:"vpc_cidr,omitempty"`
+	SubnetCIDR   string         `json:"subnet_cidr,omitempty"`
 }
 
 type jsonInputCreds struct {
@@ -164,11 +164,11 @@ func (api *httpAPI) LaunchCluster(w http.ResponseWriter, req *http.Request, para
 		StackName:    fmt.Sprintf("flynn-%d", time.Now().Unix()),
 		Region:       input.Region,
 		InstanceType: input.InstanceType,
-		VpcCidr:      input.VpcCidr,
-		SubnetCidr:   input.SubnetCidr,
+		VpcCIDR:      input.VpcCIDR,
+		SubnetCIDR:   input.SubnetCIDR,
 		creds:        creds,
 	}
-	c.cluster = &Cluster{
+	c.base = &BaseCluster{
 		ID:           c.StackName,
 		State:        "starting",
 		CredentialID: credentialID,
@@ -179,13 +179,13 @@ func (api *httpAPI) LaunchCluster(w http.ResponseWriter, req *http.Request, para
 		httphelper.Error(w, err)
 		return
 	}
-	httphelper.JSON(w, 200, c.cluster)
+	httphelper.JSON(w, 200, c.base)
 }
 
 func (api *httpAPI) DeleteCluster(w http.ResponseWriter, req *http.Request, params httprouter.Params) {
 	if err := api.Installer.DeleteCluster(params.ByName("id")); err != nil {
 		if err == ClusterNotFoundError {
-			w.WriteHeader(404)
+			httphelper.ObjectNotFoundError(w, err.Error())
 			return
 		}
 		httphelper.Error(w, err)
@@ -232,8 +232,8 @@ func (api *httpAPI) ServeApplicationJS(w http.ResponseWriter, req *http.Request,
 	path := filepath.Join("app", "build", params.ByName("assetPath"))
 	data, err := api.Asset(path)
 	if err != nil {
-		fmt.Println(err)
-		w.WriteHeader(500)
+		httphelper.Error(w, err)
+		api.logger.Debug(err.Error())
 		return
 	}
 
@@ -265,7 +265,7 @@ func (api *httpAPI) ServeTemplate(w http.ResponseWriter, req *http.Request, para
 	if req.Header.Get("Accept") == "application/json" {
 		s, err := api.Installer.FindCluster(params.ByName("id"))
 		if err != nil {
-			w.WriteHeader(404)
+			httphelper.ObjectNotFoundError(w, err.Error())
 			return
 		}
 		httphelper.JSON(w, 200, s)
@@ -274,8 +274,8 @@ func (api *httpAPI) ServeTemplate(w http.ResponseWriter, req *http.Request, para
 
 	manifest, err := api.AssetManifest()
 	if err != nil {
-		fmt.Println(err)
-		w.WriteHeader(500)
+		httphelper.Error(w, err)
+		api.logger.Debug(err.Error())
 		return
 	}
 
@@ -288,8 +288,8 @@ func (api *httpAPI) ServeTemplate(w http.ResponseWriter, req *http.Request, para
 		ReactJSPath:        manifest.Assets["react.js"],
 	})
 	if err != nil {
-		w.WriteHeader(500)
-		fmt.Println(err)
+		httphelper.Error(w, err)
+		api.logger.Debug(err.Error())
 		return
 	}
 }
