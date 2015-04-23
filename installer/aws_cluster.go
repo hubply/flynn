@@ -29,6 +29,24 @@ func (c *AWSCluster) Base() *BaseCluster {
 	return c.base
 }
 
+func (c *AWSCluster) wrapRequest(runRequest func() error) error {
+	const rateExceededErrStr = "Rate exceeded"
+	const maxBackoff = 10 * time.Second
+	backoff := 1 * time.Second
+	for {
+		err := runRequest()
+		if err != nil && err.Error() == rateExceededErrStr {
+			time.Sleep(backoff)
+			backoff = backoff * 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			continue
+		}
+		return err
+	}
+}
+
 func (c *AWSCluster) saveField(field string, value interface{}) error {
 	c.base.installer.dbMtx.Lock()
 	defer c.base.installer.dbMtx.Unlock()
@@ -126,8 +144,10 @@ func (c *AWSCluster) Delete() {
 	stackEventsSince := time.Now()
 	c.base.setState("deleting")
 	if err := c.fetchStack(); err != StackNotFoundError {
-		if err := c.cf.DeleteStack(&cloudformation.DeleteStackInput{
-			StackName: aws.String(c.StackName),
+		if err := c.wrapRequest(func() error {
+			return c.cf.DeleteStack(&cloudformation.DeleteStackInput{
+				StackName: aws.String(c.StackName),
+			})
 		}); err != nil {
 			c.base.setState("error")
 			c.base.SendError(fmt.Errorf("Unable to delete stack %s: %s", c.StackName, err))
@@ -357,8 +377,10 @@ func (c *AWSCluster) createStack() error {
 		if err := c.fetchStack(); err == nil && !strings.HasPrefix(*c.stack.StackStatus, "DELETE") {
 			if c.base.YesNoPrompt(fmt.Sprintf("Stack found from previous installation (%s), would you like to delete it? (a new one will be created either way)", c.StackName)) {
 				c.base.SendLog(fmt.Sprintf("Deleting stack %s", c.StackName))
-				if err := c.cf.DeleteStack(&cloudformation.DeleteStackInput{
-					StackName: aws.String(c.StackName),
+				if err := c.wrapRequest(func() error {
+					return c.cf.DeleteStack(&cloudformation.DeleteStackInput{
+						StackName: aws.String(c.StackName),
+					})
 				}); err != nil {
 					c.base.SendLog(fmt.Sprintf("Unable to delete stack %s: %s", c.StackName, err))
 				}
@@ -367,13 +389,18 @@ func (c *AWSCluster) createStack() error {
 	}
 
 	c.base.SendLog("Creating stack")
-	res, err := c.cf.CreateStack(&cloudformation.CreateStackInput{
-		OnFailure:        aws.String("DELETE"),
-		StackName:        aws.String(c.StackName),
-		Tags:             []cloudformation.Tag{},
-		TemplateBody:     aws.String(stackTemplateString),
-		TimeoutInMinutes: aws.Integer(10),
-		Parameters:       parameters,
+	var res *cloudformation.CreateStackResult
+	err = c.wrapRequest(func() error {
+		var err error
+		res, err = c.cf.CreateStack(&cloudformation.CreateStackInput{
+			OnFailure:        aws.String("DELETE"),
+			StackName:        aws.String(c.StackName),
+			Tags:             []cloudformation.Tag{},
+			TemplateBody:     aws.String(stackTemplateString),
+			TimeoutInMinutes: aws.Integer(10),
+			Parameters:       parameters,
+		})
+		return err
 	})
 	if err != nil {
 		return err
@@ -481,7 +508,7 @@ func (c *AWSCluster) waitForStackCompletion(action string, after time.Time) erro
 	}
 
 	for {
-		if err := fetchStackEvents(); err != nil {
+		if err := c.wrapRequest(fetchStackEvents); err != nil {
 			return err
 		}
 		if isComplete {
@@ -500,8 +527,13 @@ func (c *AWSCluster) fetchStack() error {
 	stackID := aws.String(c.StackID)
 
 	c.base.SendLog("Fetching stack")
-	res, err := c.cf.DescribeStacks(&cloudformation.DescribeStacksInput{
-		StackName: stackID,
+	var res *cloudformation.DescribeStacksResult
+	err := c.wrapRequest(func() error {
+		var err error
+		res, err = c.cf.DescribeStacks(&cloudformation.DescribeStacksInput{
+			StackName: stackID,
+		})
+		return err
 	})
 	if err != nil {
 		return err
